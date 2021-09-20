@@ -1,0 +1,150 @@
+import math
+from numba import cuda, float32
+import numpy
+import time
+
+@cuda.jit
+def ref_calculation(qos,d1j,d2j,qos_rows,qos_col):
+  i = cuda.grid(1)
+  if i < qos_col:
+    temp_min=999999999.9
+    temp_max=0.0
+    for j in range(0,qos_rows):
+        if qos[j][i]>temp_max:
+            temp_max=qos[j][i]
+        if qos[j][i]<temp_min:
+            temp_min=qos[j][i]
+    d1j[i]=temp_min
+    d2j[i]=temp_max
+
+@cuda.jit
+def max_normalization(qos,d1j,d2j,qos_rows,qos_col,NDM):
+  i,j=cuda.grid(2)
+  if i < qos_rows and j < qos_col:
+    NDM[i][j]=qos[i][j]/d2j[j] 
+
+@cuda.jit
+def min_max_normalization(qos,d1j,d2j,qos_rows,qos_col,NDM):
+  i,j=cuda.grid(2)
+  if i < qos_rows and j < qos_col:
+    NDM[i][j]=(qos[i][j]-d1j[j])/(d2j[j]-d1j[j])
+
+@cuda.jit
+def weighted_normalization(WNM,weight,NDM,qos_rows,qos_col):
+  i,j=cuda.grid(2)
+  if i < qos_rows and j < qos_col:
+    WNM[i][j]=weight[j]*NDM[i][j]
+
+@cuda.jit
+def R_plus_minus_cal(d1j,d2j,weight,qos_rows,qos_col,R_plus,R_minus):
+  i=cuda.grid(1)
+  if i < qos_col:
+    if i==0:
+        #Non beneficial Criteria
+        R_plus[i]=(d1j[i]/d2j[i])*weight[i]
+        R_minus[i]=weight[i]
+    else:
+        #beneficial Criteria
+        R_plus[i]=weight[i]
+        R_minus[i]=(d1j[i]/d2j[i])*weight[i]
+
+@cuda.jit
+def final_cal(WNM,R_plus,R_minus,qos_rows,qos_col,SI_plus,SI_minus,CC):
+  i=cuda.grid(1)
+  if i < qos_rows:
+    temp=0.0
+    temp1=0.0
+    for j in range(0,qos_col):
+        temp=temp+((WNM[i][j]-R_plus[j])*(WNM[i][j]-R_plus[j]))
+        temp1=temp1+((WNM[i][j]-R_minus[j])*(WNM[i][j]-R_minus[j]))
+    SI_plus[i]=math.sqrt(temp)
+    SI_minus[i]=math.sqrt(temp1)
+    CC[i]=SI_minus[i]/(SI_plus[i]+SI_minus[i])
+
+
+
+qos= [[250,16,12,5],[200,16,8,3],[300,32,16,4],[275,32,8,4],[225,16,16,2]]
+qos_rows=len(qos)
+qos_col=len(qos[0])
+d1j=[0.0 for i in range(qos_col)]
+d2j=[0.0 for i in range(qos_col)]
+R_plus=[0.0 for i in range(qos_col)]
+R_minus=[0.0 for i in range(qos_col)]
+SI_plus=[0.0 for i in range(qos_rows)]
+SI_minus=[0.0 for i in range(qos_rows)]
+CC=[0.0 for i in range(qos_rows)]
+NDM=[[0.0 for i in range(qos_col)] for j in range(qos_rows)] 
+WNM=[[0.0 for i in range(qos_col)] for j in range(qos_rows)] 
+weight=[0.25,0.25,0.25,0.25]
+
+#copy to global memory
+qos_global_mem = cuda.to_device(qos)
+d1j_global_mem = cuda.to_device(d1j)
+d2j_global_mem = cuda.to_device(d2j)
+weight_global_mem = cuda.to_device(weight)
+R_plus_global_mem = cuda.to_device(R_plus)
+R_minus_global_mem = cuda.to_device(R_minus)
+SI_plus_global_mem = cuda.to_device(SI_plus)
+SI_minus_global_mem = cuda.to_device(SI_minus)
+CC_global_mem = cuda.to_device(CC)
+NDM_global_mem = cuda.to_device(NDM)
+WNM_global_mem = cuda.to_device(WNM)
+
+start_time =time.time()
+
+
+service=[]
+for i in range(0,qos_rows):
+    service.append(i+1)
+start_time =time.time()
+
+threadsperblock = 250
+blockspergrid = math.ceil(250 / threadsperblock)
+ref_calculation[blockspergrid, threadsperblock](qos_global_mem,d1j_global_mem,d2j_global_mem,qos_rows,qos_col)
+d1j= d1j_global_mem.copy_to_host()
+d2j= d2j_global_mem.copy_to_host()
+
+
+threadsperblock = (250, qos_col)
+blockspergrid_x = int(math.ceil(qos_rows / threadsperblock[0]))
+blockspergrid_y = int(math.ceil(qos_col / threadsperblock[1]))
+blockspergrid = (blockspergrid_x, blockspergrid_y)
+
+#max normalization
+#max_normalization[blockspergrid, threadsperblock](qos_global_mem,d1j_global_mem,d2j_global_mem,qos_rows,qos_col,NDM_global_mem)
+#NDM = NDM_global_mem.copy_to_host()
+
+#min-max normalization
+min_max_normalization[blockspergrid, threadsperblock](qos_global_mem,d1j_global_mem,d2j_global_mem,qos_rows,qos_col,NDM_global_mem)
+NDM = NDM_global_mem.copy_to_host()
+
+weighted_normalization[blockspergrid, threadsperblock](WNM_global_mem,weight_global_mem,NDM_global_mem,qos_rows,qos_col)
+WNM = WNM_global_mem.copy_to_host()
+
+# R+ ans R-
+R_plus_minus_cal[blockspergrid, threadsperblock](d1j_global_mem,d2j_global_mem,weight_global_mem,qos_rows,qos_col,R_plus_global_mem,R_minus_global_mem)
+R_plus = R_plus_global_mem.copy_to_host()
+R_minus = R_minus_global_mem.copy_to_host()
+
+#calculation of Si+ and Si-
+final_cal[blockspergrid, threadsperblock](WNM_global_mem,R_plus_global_mem,R_minus_global_mem,qos_rows,qos_col,SI_plus_global_mem,SI_minus_global_mem,CC_global_mem)
+CC = CC_global_mem.copy_to_host()
+
+array = numpy.array(CC)
+order = array.argsort()
+ranks = order.argsort()
+l1=list(ranks)
+l2=list(service)
+l1,l2=zip(*sorted(zip(l1, l2)))
+new_tup = l2[::-1]
+duration = time.time() - start_time
+
+print("---------------------------------------------------")
+print("R-TOPSIS GPU - Number of Services:",qos_rows)
+print("---------------------------------------------------")
+print("Ranking based on R-TOPSIS !!!")
+#print(new_tup)
+print("---------------------------------------------------")
+print("Total time for Execution !!!")
+print(duration)
+

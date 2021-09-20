@@ -1,0 +1,199 @@
+import math
+from numba import cuda, float32
+import numpy
+import time
+from scipy.optimize import linprog
+
+@cuda.jit
+def ND_calculation(qos,ND,qos_rows,qos_col):
+  i=cuda.grid(1)
+  if i < qos_col:
+    temp=0.0
+    for j in range(0,qos_rows):
+        temp+=qos[j][i]*qos[j][i]
+    ND[i]=math.sqrt(temp)
+
+@cuda.jit
+def NM_calculation(qos,ND,NM,qos_rows,qos_col):
+  i,j=cuda.grid(2)
+  if i<qos_rows and j<qos_col:
+    NM[i][j]=qos[i][j]/ND[j]
+
+@cuda.jit
+def A_calculation(NM,A_plus,A_minus,qos_rows,qos_col):
+  i=cuda.grid(1)
+  if i<qos_col:
+    temp=0.0
+    temp1=99999999.99
+    for j in range(0,qos_rows):
+        if(temp<NM[j][i]):
+            temp=NM[j][i]
+        if(temp1>NM[j][i]):
+            temp1=NM[j][i]
+    A_plus[i]=temp
+    A_minus[i]=temp1
+
+@cuda.jit
+def D1_calculation(NM,A_plus,A_minus,qos_rows,qos_col,D1_plus,D1_minus,D1_denominator):
+  i=cuda.grid(1)
+  if i<qos_rows:
+    temp=0.0
+    temp1=0.0
+    for j in range(0,qos_col):
+        D1_plus[i][j]=abs(NM[i][j]-A_plus[j])
+        D1_minus[i][j]=abs(NM[i][j]-A_minus[j])
+        D1_denominator[i][j]=D1_plus[i][j]+D1_minus[i][j]
+
+@cuda.jit
+def RI_calculation(qos_rows,qos_col,D1_minus,D1_denominator,RI):
+  i,j=cuda.grid(2)
+  if i<qos_rows and j<qos_col:
+    RI[i][j]=D1_minus[i][j]/D1_denominator[i][j]
+
+@cuda.jit
+def final_calculation(weight_min,weight_max,D1_plus,D1_minus,D_plus,D_minus,RI_min,RI_max,RI_avg,qos_rows,qos_col):
+  i=cuda.grid(1)
+  if i<qos_rows:
+    temp=0.0
+    temp1=0.0
+    t=0.0
+    t1=0.0
+    for j in range(0,qos_col):
+        temp=temp+(weight_min[i][j]*D1_plus[i][j])
+        temp1=temp1+(weight_min[i][j]*D1_minus[i][j])
+        t=t+(weight_max[i][j]*D1_plus[i][j])
+        t1=t1+(weight_max[i][j]*D1_minus[i][j])
+    D_plus[i]=temp
+    D_minus[i]=temp1
+    RI_min[i]=D_minus[i]/(D_plus[i]+D_minus[i])
+    D_plus[i]=t
+    D_minus[i]=t1
+    RI_max[i]=D_minus[i]/(D_plus[i]+D_minus[i])
+    RI_avg[i]=(RI_max[i]+RI_min[i])/2
+
+
+
+
+qos= [[20,60,80,0.1],[25,65,86,0.2],[30,75,87,0.3]]
+#qos= [[250,16,12,5],[200,16,8,3],[300,32,16,4],[275,32,8,4],[225,16,16,2]]
+lb=[0.1,0.1,0.1,0.1]
+ub=[0.9,0.9,0.9,0.9]
+qos_rows=len(qos)
+qos_col=len(qos[0])
+ND=[0.0 for i in range(qos_col)]
+A_plus=[0.0 for i in range(qos_col)]
+A_minus=[0.0 for i in range(qos_col)]
+D1_plus=[[0.0 for i in range(qos_col)] for j in range(qos_rows)] 
+D1_minus=[[0.0 for i in range(qos_col)] for j in range(qos_rows)] 
+D1_denominator=[[0.0 for i in range(qos_col)] for j in range(qos_rows)] 
+RI=[[0.0 for i in range(qos_col)] for j in range(qos_rows)] 
+obj=[0.0 for i in range(qos_col)]
+NM=[[0.0 for i in range(qos_col)] for j in range(qos_rows)] 
+weight_min=[]
+weight_max=[]
+D_plus=[0.0 for i in range(qos_rows)]
+D_minus=[0.0 for i in range(qos_rows)]
+RI_min=[0.0 for i in range(qos_rows)]
+RI_max=[0.0 for i in range(qos_rows)]
+RI_avg=[0.0 for i in range(qos_rows)]
+
+
+#copy to global memory
+qos_global_mem = cuda.to_device(qos)
+lb_global_mem = cuda.to_device(lb)
+ub_global_mem = cuda.to_device(ub)
+ND_global_mem = cuda.to_device(ND)
+A_plus_global_mem = cuda.to_device(A_plus)
+A_minus_global_mem = cuda.to_device(A_minus)
+D1_plus_global_mem = cuda.to_device(D1_plus)
+D1_minus_global_mem = cuda.to_device(D1_minus)
+D1_denominator_global_mem = cuda.to_device(D1_denominator)
+RI_global_mem = cuda.to_device(RI)
+NM_global_mem = cuda.to_device(NM)
+D_plus_global_mem = cuda.to_device(D_plus)
+D_minus_global_mem = cuda.to_device(D_minus)
+RI_min_global_mem = cuda.to_device(RI_min)
+RI_max_global_mem = cuda.to_device(RI_max)
+RI_avg_global_mem = cuda.to_device(RI_avg)
+
+service=[]
+for i in range(0,qos_rows):
+    service.append(i+1)
+start_time =time.time()
+
+threadsperblock = 250
+blockspergrid = math.ceil(250 / threadsperblock)
+ND_calculation[blockspergrid, threadsperblock](qos_global_mem,ND_global_mem,qos_rows,qos_col)
+ND= ND_global_mem.copy_to_host()
+
+threadsperblock = (250, qos_col)
+blockspergrid_x = int(math.ceil(qos_rows / threadsperblock[0]))
+blockspergrid_y = int(math.ceil(qos_col / threadsperblock[1]))
+blockspergrid = (blockspergrid_x, blockspergrid_y)
+
+NM_calculation[blockspergrid, threadsperblock](qos_global_mem,ND_global_mem,NM_global_mem,qos_rows,qos_col)
+NM= NM_global_mem.copy_to_host()
+
+threadsperblock = 250
+blockspergrid = math.ceil(250 / threadsperblock)
+A_calculation[blockspergrid, threadsperblock](NM_global_mem,A_plus_global_mem,A_minus_global_mem,qos_rows,qos_col)
+A_plus= A_plus_global_mem.copy_to_host()
+A_minus= A_minus_global_mem.copy_to_host()
+
+D1_calculation[blockspergrid, threadsperblock](NM_global_mem,A_plus_global_mem,A_minus_global_mem,qos_rows,qos_col,D1_plus_global_mem,D1_minus_global_mem,D1_denominator_global_mem)
+D1_plus= D1_plus_global_mem.copy_to_host()
+D1_minus= D1_minus_global_mem.copy_to_host()
+D1_denominator= D1_denominator_global_mem.copy_to_host()
+
+threadsperblock = (250, qos_col)
+blockspergrid_x = int(math.ceil(qos_rows / threadsperblock[0]))
+blockspergrid_y = int(math.ceil(qos_col / threadsperblock[1]))
+blockspergrid = (blockspergrid_x, blockspergrid_y)
+
+RI_calculation[blockspergrid, threadsperblock](qos_rows,qos_col,D1_minus_global_mem,D1_denominator_global_mem,RI_global_mem)
+RI= RI_global_mem.copy_to_host()
+
+for i in range(0,qos_rows):
+    for j in range(0,qos_col):
+        obj[j]=RI[i][j]
+    lhs_eq = [[1, 1,1,1]]
+    rhs_eq = [1]
+    bnd = [(0.5, 0.9),(0.1, 0.9),(0.1, 0.9),(0.1, 0.9)]
+    opt = linprog(c=obj,A_eq=lhs_eq, b_eq=rhs_eq, bounds=bnd,method="revised simplex")
+    
+    weight_max.append(list(opt.x))
+    
+    for j in range(0,qos_col):
+        obj[j]=RI[i][j]*-1
+    lhs_eq = [[1, 1,1,1]]
+    rhs_eq = [1]
+    bnd = [(0.5, 0.9),(0.1, 0.9),(0.1, 0.9),(0.1, 0.9)]
+    opt = linprog(c=obj,A_eq=lhs_eq, b_eq=rhs_eq, bounds=bnd,method="revised simplex")
+    
+    weight_min.append(list(opt.x))
+
+weight_min_global_mem = cuda.to_device(weight_min)
+weight_max_global_mem = cuda.to_device(weight_max)
+
+threadsperblock = 250
+blockspergrid = math.ceil(250 / threadsperblock)
+final_calculation[blockspergrid, threadsperblock](weight_min_global_mem,weight_max_global_mem,D1_plus_global_mem,D1_minus_global_mem,D_plus_global_mem,D_minus_global_mem,RI_min_global_mem,RI_max_global_mem,RI_avg_global_mem,qos_rows,qos_col)
+RI_avg= RI_avg_global_mem.copy_to_host()
+
+array = numpy.array(RI_avg)
+order = array.argsort()
+ranks = order.argsort()
+l1=list(ranks)
+l2=list(service)
+l1,l2=zip(*sorted(zip(l1, l2)))
+new_tup = l2[::-1]
+duration = time.time() - start_time
+
+print("---------------------------------------------------")
+print("uv-TOPSIS GPU - Number of Services:",qos_rows)
+print("---------------------------------------------------")
+print("Ranking based on uv-TOPSIS !!!")
+#print(new_tup)
+print("---------------------------------------------------")
+print("Total time for Execution !!!")
+print(duration)

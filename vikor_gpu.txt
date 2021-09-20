@@ -1,0 +1,208 @@
+from __future__ import division
+from decimal import Decimal
+from numba import cuda, float32
+import numpy
+import math
+import time
+
+@cuda.jit
+def best_worst_cal(qos,best,worst,qos_rows,qos_col):
+  col = cuda.grid(1)
+  if col < qos_col:
+    if col==0:
+      temp=999999
+      temp1=0
+      for i in range(0,qos_rows):
+        if temp>qos[i][col]:
+          temp=qos[i][col]
+        if temp1<qos[i][col]:
+          temp1=qos[i][col]
+      best[col]=temp
+      worst[col]=temp1
+    else:
+      temp1=999999
+      temp=0
+      for i in range(0,qos_rows):
+        if temp<qos[i][col]:
+          temp=qos[i][col]
+        if temp1>qos[i][col]:
+          temp1=qos[i][col]
+      best[col]=temp
+      worst[col]=temp1
+
+@cuda.jit
+def IA_cal(qos,IA,W,best,worst,qos_rows,qos_col):
+    row, col = cuda.grid(2)
+    if row < qos_rows and col < qos_col:
+      temp=W[col]*((best[col]-qos[row][col])/(best[col]-worst[col]))
+      IA[row][col]=temp
+         
+@cuda.jit
+def SI_RI_cal(IA,SI,RI,qos_rows,qos_col):
+    row = cuda.grid(1)
+    if row < qos_rows:
+      temp=0
+      temp1=0
+      for i in range (0,qos_col):
+        temp+=IA[row][i]
+        if IA[row][i]>temp1:
+          temp1=IA[row][i]
+      SI[row]=temp
+      RI[row]=temp1
+
+@cuda.jit
+def QI_cal(QI,SI,RI,qos_rows,qos_col,SP,SN,RP,RN,gamma):
+    row = cuda.grid(1)
+    if row < qos_rows:
+      QI[row]=(gamma*((SI[row]-SP)/(SN-SP)))+((1-gamma)*((RI[row]-RP)/(RN-RP)))
+
+
+
+qos= [[250,16,12,5],[200,16,8,3],[300,32,16,4],[275,32,8,4],[225,16,16,2]]
+qos_rows=len(qos)
+qos_col=4
+gamma=0.5
+weight=[0.35,0.3,0.2,0.15]
+best_x=[0.0 for i in range(qos_col)]
+worst_x=[0.0 for i in range(qos_col)]
+IA = [[0.0 for i in range(qos_col)] for j in range(qos_rows)] 
+SI=[0.0 for i in range(qos_rows)]
+RI=[0.0 for i in range(qos_rows)]
+SP=0
+SN=0
+RP=0
+RN=0
+QI=[0.0 for i in range(qos_rows)]
+QI_rank=[0.0 for i in range(qos_rows)]
+RI_rank=0
+SI_rank=0
+DQ=0
+service=[]
+for i in range(0,qos_rows):
+    service.append(i)
+
+#copy to global memory
+qos_global_mem = cuda.to_device(qos)
+IA_global_mem = cuda.to_device(IA)
+weight_global_mem = cuda.to_device(weight)
+best_x_global_mem = cuda.to_device(best_x)
+worst_x_global_mem = cuda.to_device(worst_x)
+SI_global_mem = cuda.to_device(SI)
+RI_global_mem = cuda.to_device(RI)
+QI_global_mem = cuda.to_device(QI)
+
+
+# Configure the blocks for best_worst_cal
+threadsperblock = qos_col
+blockspergrid = math.ceil(qos_col / threadsperblock)
+
+start_time = time.time()
+
+best_worst_cal[blockspergrid, threadsperblock](qos_global_mem,best_x_global_mem,worst_x_global_mem,qos_rows,qos_col)
+
+best_x = best_x_global_mem.copy_to_host()
+worst_x = worst_x_global_mem.copy_to_host()
+
+# Configure the blocks for intermediate array
+
+threadsperblock = (250, qos_col)
+blockspergrid_x = int(math.ceil(qos_rows / threadsperblock[0]))
+blockspergrid_y = int(math.ceil(qos_col / threadsperblock[1]))
+blockspergrid = (blockspergrid_x, blockspergrid_y)
+
+IA_cal[blockspergrid, threadsperblock](qos_global_mem,IA_global_mem,weight_global_mem,best_x_global_mem,worst_x_global_mem,qos_rows,qos_col)
+
+IA = IA_global_mem.copy_to_host()
+
+#configure blocks for SI, RI
+
+threadsperblock = 250
+blockspergrid = math.ceil(qos_rows / threadsperblock)
+
+SI_RI_cal[blockspergrid, threadsperblock](IA_global_mem,SI_global_mem,RI_global_mem,qos_rows,qos_col)
+
+SI = SI_global_mem.copy_to_host()
+RI = RI_global_mem.copy_to_host()
+
+SP=min(SI)
+SN=max(SI)
+RP=min(RI)
+RN=max(RI)
+
+#configure blocks for QI
+threadsperblock = 250
+blockspergrid = math.ceil(qos_rows / threadsperblock)
+
+QI_cal[blockspergrid, threadsperblock](QI_global_mem,SI_global_mem,RI_global_mem,qos_rows,qos_col,SP,SN,RP,RN,gamma)
+
+QI = QI_global_mem.copy_to_host()
+
+#print(QI)
+
+#rank QI
+array = numpy.array(QI)
+order = array.argsort()
+ranks = order.argsort()
+l1=list(ranks)
+l2=list(service)
+l1,l2=zip(*sorted(zip(l1, l2)))
+new_tup = l2[::-1] 
+r=qos_rows
+for i in range(0,qos_rows):
+    QI_rank[new_tup[i]]=r
+    r=r-1
+RI=list(RI)
+SI=list(SI)
+#find 1st in SI and RI
+RI_rank=(RI.index(min(RI)))+1
+SI_rank=(SI.index(min(SI)))+1
+DQ=1/(qos_rows-1)
+
+#checking condition 1
+C1=0
+temp=QI[QI_rank.index(2)]-QI[QI_rank.index(1)]
+if(temp>=DQ):
+    #print("Condition 1 Pass")
+    C1=1
+#else:
+    #print("Condition 1 Fail")
+
+
+#checking condition 2
+C2=0
+s1=service[QI_rank.index(1)]
+if(s1==RI_rank or s1==SI_rank):
+    #print("Condition 2 Pass")
+    C2=1
+#else:
+    #print("Condition 2 Fail")
+alternatives=[]
+#print alternatives
+if(C2==0):
+    #print("Only 2 Alternatives Available !!!")
+    alternatives.append(service[QI_rank.index(1)]+1)
+    alternatives.append(service[QI_rank.index(2)]+1)
+    #print("Service:",service[QI_rank.index(1)]+1,"Service:",service[QI_rank.index(2)]+1)
+elif(C1==0):
+    #print("The best alternatives are:")
+    alternatives.append(service[QI_rank.index(1)]+1)
+    for i in range(1,qos_rows):
+        t1=QI[QI_rank.index(i+1)]-QI[QI_rank.index(1)]
+        if(t1<=DQ):
+            alternatives.append(service[QI_rank.index(i+1)]+1)
+        else:
+            break       
+    #print(alternatives)    
+
+duration = time.time() - start_time  
+
+print("---------------------------------------------------")
+print("VIKOR GPU - Number of Services:",qos_rows)
+print("---------------------------------------------------")
+print("The best alternatives:")
+print(alternatives)
+print("---------------------------------------------------")
+print("Total time for Execution !!!")
+print(duration)  
+
+

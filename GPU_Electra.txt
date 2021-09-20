@@ -1,0 +1,226 @@
+import math
+from numba import cuda, float32
+import numpy
+import time
+
+@cuda.jit
+def D_NM_calculation(qos,D_NM,qos_rows,qos_col):
+  col = cuda.grid(1)
+  if col < qos_col:
+    temp=0.0
+    for k in range(0,qos_rows):
+        temp=temp+(qos[k][col]*qos[k][col])
+    D_NM[col]=math.sqrt(temp)
+    
+@cuda.jit
+def normalization_cal(qos,D_NM,NM,qos_rows,qos_col):
+  row, col = cuda.grid(2)
+  if row < qos_rows and col < qos_col:
+    NM[row][col]=qos[row][col]/D_NM[col]
+
+@cuda.jit
+def weighted_normalization_cal(WNM,NM,weight,qos_rows,qos_col):
+  row, col = cuda.grid(2)
+  if row < qos_rows and col < qos_col:
+    WNM[row][col]=NM[row][col]*weight[col]
+
+@cuda.jit
+def M_C_cal(WNM,M_C,weight,qos_rows,qos_col):
+  row, col = cuda.grid(2)
+  if row < qos_rows and col < qos_rows:
+    if row==col:
+        M_C[row][col]=0
+    else:
+        for k in range(0,qos_col):
+          if WNM[row][k]>=WNM[col][k]:
+            M_C[row][col]+=weight[k]
+
+@cuda.jit
+def M_C_cal_fin(C_C,M_C,qos_rows,qos_col):
+  row, col = cuda.grid(2)
+  if row < qos_rows and col < qos_col:
+    temp=M_C[row][col]
+    temp1=C_C[row][col]
+    if temp>temp1:
+      M_C[row][col]=1
+    else:
+      M_C[row][col]=0
+   
+@cuda.jit
+def D_M_calculation(WNM,M_D1,D1_N,qos_rows,qos_col):
+  row= cuda.grid(1)
+  if row < qos_rows:
+    i=(row*qos_rows)-row
+    for j in range(0,qos_rows):
+        if row!=j:
+            for k in range(0,qos_col):
+                M_D1[i][k]=WNM[row][k]-WNM[j][k]
+            i=i+1    
+
+@cuda.jit
+def negative_min_calculation(D1_N,M_D1,qos_rows,qos_col):
+  row= cuda.grid(1)
+  if row < qos_rows*(qos_rows-1):
+    temp=0.0
+    for i in range(0,qos_col):
+      if M_D1[row][i]<0:
+        if temp>M_D1[row][i]:
+          temp=M_D1[row][i]
+    D1_N[row]=temp*-1
+
+@cuda.jit
+def max_calculation(D1_D,M_D1,qos_rows,qos_col):
+  row= cuda.grid(1)
+  if row < qos_rows*(qos_rows-1):
+    temp=0.0
+    temp1=0.0
+    for i in range(0,qos_col):
+      if M_D1[row][i]<0:
+        temp1=M_D1[row][i]*-1
+      else:
+        temp1=M_D1[row][i]
+      if temp1>temp:
+          temp=temp1
+      D1_D[row]=temp
+
+@cuda.jit
+def discordance_cal(M_D,D1_N,D1_D,qos_rows,qos_col):
+  row= cuda.grid(1)
+  if row < qos_rows:
+    counter=(row*qos_rows)-row
+    for j in range(0,qos_rows):
+        if(row!=j):
+            M_D[row][j]=D1_N[counter]/D1_D[counter]
+            #D=D+M_D[i][j]
+            counter=counter+1
+
+
+@cuda.jit
+def M_D_cal_fin(D_D,M_D,qos_rows,qos_col):
+  row, col = cuda.grid(2)
+  if row < qos_rows and col < qos_col:
+    temp=M_D[row][col]
+    temp1=D_D[row][col]
+    if float(temp)>float(temp1):
+      M_D[row][col]=1
+    else:
+      M_D[row][col]=0
+
+@cuda.jit
+def electra_fin(M_C,M_D,M_F,qos_rows,qos_col):
+  row, col = cuda.grid(2)
+  if row < qos_rows and col < qos_rows:
+    if M_C[row][col]==1 and M_D[row][col]==1:
+      M_F[row][col]=1
+    else:
+      M_F[row][col]=0
+
+
+qos= [[25,20,15,30],[10,30,20,30],[30,10,30,10]]
+qos_rows=len(qos)
+qos_col=4
+NM=[[0.0 for i in range(qos_col)] for j in range(qos_rows)] 
+D_NM=[0.0 for i in range(qos_col)]
+WNM=[[0.0 for i in range(qos_col)] for j in range(qos_rows)] 
+weight=[0.2,0.15,0.4,0.25]
+M_C=[[0.0 for i in range(qos_rows)] for j in range(qos_rows)] 
+C=0.0
+M_D1=[[0.0 for i in range(qos_col)] for j in range(qos_rows*(qos_rows-1))] 
+D1_N=[0.0 for i in range(qos_rows*(qos_rows-1))]
+D1_D=[0.0 for i in range(qos_rows*(qos_rows-1))]
+M_D=[[0.0 for i in range(qos_rows)] for j in range(qos_rows)] 
+D=0.0
+M_F=[[0.0 for i in range(qos_rows)] for j in range(qos_rows)] 
+
+#copy to global memory
+qos_global_mem = cuda.to_device(qos)
+NM_global_mem = cuda.to_device(NM)
+D_NM_global_mem = cuda.to_device(D_NM)
+weight_global_mem = cuda.to_device(weight)
+WNM_global_mem = cuda.to_device(WNM)
+M_C_global_mem = cuda.to_device(M_C)
+M_D1_global_mem = cuda.to_device(M_D1)
+D1_N_global_mem = cuda.to_device(D1_N)
+D1_D_global_mem = cuda.to_device(D1_D)
+M_D_global_mem = cuda.to_device(M_D)
+M_F_global_mem = cuda.to_device(M_F)
+C_global_mem = cuda.to_device(C)
+D_global_mem = cuda.to_device(D)
+
+start_time =time.time()
+
+threadsperblock = qos_col
+blockspergrid = math.ceil(qos_col / threadsperblock)
+D_NM_calculation[blockspergrid, threadsperblock](qos_global_mem,D_NM_global_mem,qos_rows,qos_col)
+D_NM = D_NM_global_mem.copy_to_host()
+
+threadsperblock = (250, qos_col)
+blockspergrid_x = int(math.ceil(qos_rows / threadsperblock[0]))
+blockspergrid_y = int(math.ceil(qos_col / threadsperblock[1]))
+blockspergrid = (blockspergrid_x, blockspergrid_y)
+
+normalization_cal[blockspergrid, threadsperblock](qos_global_mem,D_NM_global_mem,NM_global_mem,qos_rows,qos_col)
+NM = NM_global_mem.copy_to_host()
+
+weighted_normalization_cal[blockspergrid, threadsperblock](WNM_global_mem,NM_global_mem,weight_global_mem,qos_rows,qos_col)
+WNM = WNM_global_mem.copy_to_host()
+
+M_C_cal[blockspergrid, threadsperblock](WNM_global_mem,M_C_global_mem,weight_global_mem,qos_rows,qos_col)
+M_C = M_C_global_mem.copy_to_host()
+#print(M_C)
+temp=0.0
+for i in range(0,qos_rows):
+    for j in range(0,qos_rows):
+        temp+=M_C[i][j]
+C=temp/(qos_rows*2)
+
+C_C=[[C for i in range(qos_rows)] for j in range(qos_rows)] 
+C_C_global_mem = cuda.to_device(C_C)
+
+M_C_cal_fin[blockspergrid, threadsperblock](C_C_global_mem,M_C_global_mem,qos_rows,qos_col)
+M_C = M_C_global_mem.copy_to_host()
+#print(M_C)
+threadsperblock = 250
+blockspergrid = math.ceil(250 / threadsperblock)
+D_M_calculation[blockspergrid, threadsperblock](WNM_global_mem,M_D1_global_mem,D1_N_global_mem,qos_rows,qos_col)
+M_D1 = M_D1_global_mem.copy_to_host()
+
+negative_min_calculation[blockspergrid, threadsperblock](D1_N_global_mem,M_D1_global_mem,qos_rows,qos_col)
+D1_N = D1_N_global_mem.copy_to_host()
+
+max_calculation[blockspergrid, threadsperblock](D1_D_global_mem,M_D1_global_mem,qos_rows,qos_col)
+D1_D = D1_D_global_mem.copy_to_host()
+
+discordance_cal[blockspergrid, threadsperblock](M_D_global_mem,D1_N_global_mem,D1_D_global_mem,qos_rows,qos_col)
+M_D = M_D_global_mem.copy_to_host()
+
+temp=0.0
+for i in range(0,qos_rows):
+    for j in range(0,qos_rows):
+        D=D+M_D[i][j]
+D=D/(qos_rows*2)
+D_D=[[D for i in range(qos_rows)] for j in range(qos_rows)] 
+D_D_global_mem = cuda.to_device(D_D)
+
+threadsperblock = (250, qos_col)
+blockspergrid_x = int(math.ceil(qos_rows / threadsperblock[0]))
+blockspergrid_y = int(math.ceil(qos_col / threadsperblock[1]))
+blockspergrid = (blockspergrid_x, blockspergrid_y)
+
+M_D_cal_fin[blockspergrid, threadsperblock](D_D_global_mem,M_D_global_mem,qos_rows,qos_col)
+M_D = M_D_global_mem.copy_to_host()
+
+electra_fin[blockspergrid, threadsperblock](M_C_global_mem,M_D_global_mem,M_F_global_mem,qos_rows,qos_col)
+M_F = M_F_global_mem.copy_to_host()
+duration = time.time() - start_time
+print("---------------------------------------------------")
+print("ELECTRA GPU - Number of Services:",qos_rows)
+print("---------------------------------------------------")
+print("Ranking based on ELECTRA !!!")
+#for i in range(0,qos_rows):
+    #for j in range(0,qos_rows):
+        #if M_F[i][j]==1:
+            #print("Service ",i+1," is better than Service ",j+1)
+print("---------------------------------------------------")
+print("Total time for Execution !!!")
+print(duration)      

@@ -1,0 +1,145 @@
+import math
+from numba import cuda, float32
+import numpy
+import time
+
+@cuda.jit
+def Max_Min_calculation(qos,Max,Min,qos_rows,qos_col):
+  col = cuda.grid(1)
+  if col < qos_col:
+    temp=0.0
+    temp1=99999999999
+    for j in range(0,qos_rows):
+        if qos[j][col]>temp:
+            temp=qos[j][col]
+        if qos[j][col]<temp1:
+            temp1=qos[j][col]
+    Max[col]=temp
+    Min[col]=temp1
+
+@cuda.jit
+def normalization_calculation(qos,Max,Min,NM,qos_rows,qos_col):
+  row , col = cuda.grid(2)
+  if row < qos_rows and col < qos_col:
+    if col==0:
+      NM[row][col]=(Max[col]-qos[row][col])/(Max[col]-Min[col])
+    else:
+      NM[row][col]=(qos[row][col]-Min[col])/(Max[col]-Min[col])
+
+@cuda.jit
+def relative_difference_calculation(RD,NM,qos_rows,qos_col,Sum,weight):
+  row = cuda.grid(1)
+  if row < qos_rows:
+    counter=(row*qos_rows)-row
+    for j in range(0,qos_rows):
+        if row!=j:
+            temp=0.0
+            for k in range(0,qos_col):
+                RD[counter][k]=NM[row][k]-NM[j][k]
+                if RD[counter][k]<=0:
+                  RD[counter][k]=0
+                RD[counter][k]=weight[k]*RD[counter][k]
+                temp=temp+RD[counter][k]
+            Sum[counter]=temp
+            counter=counter+1
+
+@cuda.jit
+def matrix_calculation(M_C,Sum,qos_rows,qos_col):
+  i = cuda.grid(1)
+  if i < qos_rows:
+    counter=(i*qos_rows)-i
+    for j in range(0,qos_rows):
+        if i==j:
+            M_C[i][j]=0
+        else:
+            M_C[i][j]=Sum[counter]
+            counter=counter+1
+
+@cuda.jit
+def final_calculation(M_C,Average_row,Average_col,final_value,qos_rows,qos_col):
+  i = cuda.grid(1)
+  if i < qos_rows:
+    temp=0.0
+    temp1=0.0
+    for j in range(0,qos_rows):
+        temp=temp+M_C[i][j]
+        temp1=temp1+M_C[j][i]
+    Average_row[i]=temp/(qos_rows-1)
+    Average_col[i]=temp1/(qos_rows-1) 
+    final_value[i]=Average_row[i]-Average_col[i] 
+
+
+qos= [[250,16,12,5],[200,16,8,3],[300,32,16,4],[275,32,8,2]]
+qos_rows=len(qos)
+qos_col=4
+Max=[0.0 for i in range(qos_col)]
+Min=[0.0 for i in range(qos_col)]
+NM=[[0.0 for i in range(qos_col)] for j in range(qos_rows)] 
+RD=[[0.0 for i in range(qos_col)] for j in range(qos_rows*(qos_rows-1))] 
+weight=[0.35,0.25,0.25,0.15]
+Sum=[0.0 for i in range(qos_rows*(qos_rows-1))]
+M_C=[[0.0 for i in range(qos_rows)] for j in range(qos_rows)] 
+Average_row=[0.0 for i in range(qos_rows)]
+Average_col=[0.0 for i in range(qos_rows)]
+final_value=[0.0 for i in range(qos_rows)]
+service=[]
+for i in range(0,qos_rows):
+    service.append(i+1)
+
+#copy to global memory
+qos_global_mem = cuda.to_device(qos)
+Max_global_mem = cuda.to_device(Max)
+Min_global_mem = cuda.to_device(Min)
+weight_global_mem = cuda.to_device(weight)
+NM_global_mem = cuda.to_device(NM)
+RD_global_mem = cuda.to_device(RD)
+Sum_global_mem = cuda.to_device(Sum)
+M_C_global_mem = cuda.to_device(M_C)
+Average_row_global_mem = cuda.to_device(Average_row)
+Average_col_global_mem = cuda.to_device(Average_col)
+final_value_global_mem = cuda.to_device(final_value)
+
+start_time =time.time()
+
+threadsperblock = qos_col
+blockspergrid = math.ceil(qos_col / threadsperblock)
+Max_Min_calculation[blockspergrid, threadsperblock](qos_global_mem,Max_global_mem,Min_global_mem,qos_rows,qos_col)
+Max = Max_global_mem.copy_to_host()
+Min = Min_global_mem.copy_to_host()
+
+threadsperblock = (250, qos_col)
+blockspergrid_x = int(math.ceil(qos_rows / threadsperblock[0]))
+blockspergrid_y = int(math.ceil(qos_col / threadsperblock[1]))
+blockspergrid = (blockspergrid_x, blockspergrid_y)
+normalization_calculation[blockspergrid, threadsperblock](qos_global_mem,Max_global_mem,Min_global_mem,NM_global_mem,qos_rows,qos_col)
+NM = NM_global_mem.copy_to_host()
+
+threadsperblock = 250
+blockspergrid = math.ceil(250 / threadsperblock)
+relative_difference_calculation[blockspergrid, threadsperblock](RD_global_mem,NM_global_mem,qos_rows,qos_col,Sum_global_mem,weight_global_mem)
+Sum = Sum_global_mem.copy_to_host()
+
+matrix_calculation[blockspergrid, threadsperblock](M_C_global_mem,Sum_global_mem,qos_rows,qos_col)
+M_C = M_C_global_mem.copy_to_host()
+
+final_calculation[blockspergrid, threadsperblock](M_C_global_mem,Average_row_global_mem,Average_col_global_mem,final_value_global_mem,qos_rows,qos_col)
+final_value = final_value_global_mem.copy_to_host()
+
+array = numpy.array(final_value)
+order = array.argsort()
+ranks = order.argsort()
+l1=list(ranks)
+l2=list(service)
+l1,l2=zip(*sorted(zip(l1, l2)))
+new_tup = l2[::-1]
+duration = time.time() - start_time
+
+print("---------------------------------------------------")
+print("PROMETHEE GPU - Number of Services:",qos_rows)
+print("---------------------------------------------------")
+print("Ranking based on PROMETHEE !!!")
+#print(new_tup)
+print("---------------------------------------------------")
+print("Total time for Execution !!!")
+print(duration)
+

@@ -1,0 +1,91 @@
+from __future__ import division
+from numba import cuda, float32
+import numpy
+import math
+
+
+@cuda.jit
+def square_of_qos(A,B,qos_col,qos_rows):
+    row, col = cuda.grid(2)
+    if row < qos_rows and col < qos_col:
+         tmp=float(A[row][col])*float(A[row][col])
+         B[row][col]=tmp
+
+@cuda.jit
+def average_of_qos(A,C,qos_col,qos_rows):
+    col = cuda.grid(1)
+    if col < qos_col:
+      for i in range(0,qos_rows):
+         tmp=float(A[i][col])
+         C[col]=C[col]+tmp
+
+@cuda.jit
+def average_matrix(C,M,qos_col):
+    col = cuda.grid(1)
+    if col < qos_col:
+         M[col]=math.sqrt(float(C[col]))
+
+@cuda.jit
+def normalized_decision_matrix(A,M,N,qos_col,qos_rows):
+    col = cuda.grid(1)
+    if col < qos_col:
+      for i in range(0,qos_rows):
+         N[i][col]=float(A[i][col])/float(M[col])
+
+
+
+
+service=["S1","s2","s3","s4","s5"]
+qos= [[1656,0.86,239843,23728],[1565,1.592091,296180,58529],[1857,34.071731,396760,61762],[1189,1.54,209868,42345],[928,0.978,169987,32223]]
+qos_rows=5
+qos_col=4
+average=[0.0,0.0,0.0,0.0]
+matrix_average=[0.0,0.0,0.0,0.0]
+
+#calculate average sqrt(sum(square of each cell value))
+A_global_mem = cuda.to_device(qos)
+B_global_mem = cuda.to_device(qos)
+C_global_mem = cuda.to_device(average)
+M_global_mem = cuda.to_device(matrix_average)
+
+# Configure the blocks for square
+threadsperblock = (qos_rows, qos_col)
+blockspergrid_x = int(math.ceil(qos_rows / threadsperblock[0]))
+blockspergrid_y = int(math.ceil(qos_col / threadsperblock[1]))
+blockspergrid = (blockspergrid_x, blockspergrid_y)
+
+square_of_qos[blockspergrid, threadsperblock](A_global_mem, B_global_mem,qos_col,qos_rows)
+square_qos = B_global_mem.copy_to_host()
+
+# Configure the blocks for sum of square
+threadsperblock = (qos_rows, qos_col)
+blockspergrid_x = int(math.ceil(qos_rows / threadsperblock[0]))
+blockspergrid_y = int(math.ceil(qos_col / threadsperblock[1]))
+blockspergrid = (blockspergrid_x, blockspergrid_y)
+
+average_of_qos[blockspergrid, threadsperblock](B_global_mem, C_global_mem,qos_col,qos_rows)
+average = C_global_mem.copy_to_host()
+C_global_mem = cuda.to_device(average)
+
+# Configure the blocks for average matrix
+threadsperblock = qos_col
+blockspergrid = math.ceil(qos_col / threadsperblock)
+
+average_matrix[blockspergrid, threadsperblock](C_global_mem,M_global_mem,qos_col)
+matrix_average = M_global_mem.copy_to_host()
+
+#configure blocks for Normalized decision matrix
+threadsperblock = qos_col
+blockspergrid = math.ceil(qos_col / threadsperblock)
+N_global_mem = cuda.to_device(qos)
+A_global_mem = cuda.to_device(qos)
+M_global_mem = cuda.to_device(matrix_average)
+
+normalized_decision_matrix[blockspergrid, threadsperblock](A_global_mem, M_global_mem,N_global_mem,qos_col,qos_rows)
+N_matrix = N_global_mem.copy_to_host()
+
+# calculate 
+print(average)
+print(matrix_average)
+print(N_matrix)
+

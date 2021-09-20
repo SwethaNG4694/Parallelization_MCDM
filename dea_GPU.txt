@@ -1,0 +1,109 @@
+from scipy.optimize import linprog
+import math
+from numba import cuda, float32
+import numpy
+import time
+
+@cuda.jit
+def average_calculation(qos,A,qos_rows,qos_col):
+  col = cuda.grid(1)
+  if col < qos_col:
+    temp=0.0
+    for i in range(0,qos_rows):
+      temp+=qos[i][col]*qos[i][col]
+    A[col]=math.sqrt(temp)
+
+@cuda.jit
+def normalization_cal(qos,A,NM,qos_rows,qos_col):
+  row, col = cuda.grid(2)
+  if row < qos_rows and col < qos_col:
+    temp=qos[row][col]/A[col]
+    NM[row][col]=temp
+
+        
+
+
+qos= [[250,16,12,4],[225,16,8,5],[300,32,16,4.5],[275,32,8,4]]
+qos_rows=len(qos)
+qos_col=4
+average_col=[0.0 for i in range(qos_col)]
+GK=[0.0 for i in range(qos_rows)]
+HK=[0.0 for i in range(qos_rows)]
+NM = [[0.0 for i in range(qos_col)] for j in range(qos_rows)] 
+service=[]
+alternatives=[]
+for i in range(0,qos_rows):
+    service.append(i+1)
+
+#copy to global memory
+qos_global_mem = cuda.to_device(qos)
+average_col_global_mem = cuda.to_device(average_col)
+GK_global_mem = cuda.to_device(GK)
+HK_global_mem = cuda.to_device(HK)
+NM_global_mem = cuda.to_device(NM)
+
+# Configure the blocks average_Cal
+threadsperblock = qos_col
+blockspergrid = math.ceil(qos_col / threadsperblock)
+
+start_time =time.time()    
+
+average_calculation[blockspergrid, threadsperblock](qos_global_mem,average_col_global_mem,qos_rows,qos_col)
+
+average_col = average_col_global_mem.copy_to_host()
+
+#configure the blocks for Normalized Matrix
+threadsperblock = (250, qos_col)
+blockspergrid_x = int(math.ceil(qos_rows / threadsperblock[0]))
+blockspergrid_y = int(math.ceil(qos_col / threadsperblock[1]))
+blockspergrid = (blockspergrid_x, blockspergrid_y)
+
+normalization_cal[blockspergrid, threadsperblock](qos_global_mem,average_col_global_mem,NM_global_mem,qos_rows,qos_col)
+
+NM = NM_global_mem.copy_to_host()
+
+# solving the linear equation not possible in numba cuda
+for i1 in range(0,qos_rows):
+    obj=[]
+    lhs_ineq=[]
+    rhs_ineq=[]
+    lhs_eq=[]
+    rhs_eq=[]
+    obj.append(NM[i1][0])
+    obj.append(0)
+    obj.append(0)
+    obj.append(0)
+    t11=[]
+    t11.append(0)
+    t11.append(NM[i1][1])
+    t11.append(NM[i1][2])
+    t11.append(NM[i1][3])
+    lhs_eq.append(t11)
+    rhs_eq.append(1)
+    for i in range(0,qos_rows):
+        t1=[]
+        for j in range(0,qos_col):
+            if j==0:
+                t1.append(-1*NM[i][j])
+            else:
+                t1.append(NM[i][j])
+        lhs_ineq.append(t1) 
+        rhs_ineq.append(0)
+    bnd = [(0, float("inf")),  (0, float("inf")), (0, float("inf")), (0, float("inf"))] 
+    #print(lhs_ineq)
+    opt = linprog(c=obj, A_ub=lhs_ineq, b_ub=rhs_ineq,A_eq=lhs_eq, b_eq=rhs_eq, bounds=bnd,method="revised simplex")
+    GK[i1]=round(opt.fun,2)
+    if GK[i1]==1.0:
+      alternatives.append(service[i1])
+
+duration = time.time() - start_time  
+    
+print("---------------------------------------------------")
+print("DEA GPU - Number of Services:",qos_rows)
+print("---------------------------------------------------")
+print("The best alternatives:")
+print(alternatives)
+print("---------------------------------------------------")
+print("Total time for Execution !!!")
+print(duration)  
+

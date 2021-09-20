@@ -1,0 +1,127 @@
+import math
+from numba import cuda, float32
+import numpy
+import time
+
+@cuda.jit
+def RIM_calculation(qos,NM,ref,qos_rows,qos_col,weight,WNM):
+  i , j = cuda.grid(2)
+  if i < qos_rows and j < qos_col:
+        x=qos[i][j]
+        A=ref[j][0]
+        B=ref[j][1]
+        C=ref[j][2]
+        D=ref[j][3]
+        #print(x," ",A," ",B," ",C," ",D)
+        if x>=C and x<=D:
+            #print("condition 1 satisfied")
+            NM[i][j]=1
+            WNM[i][j]=weight[j]*NM[i][j]
+        elif x>=A and x<=C and A!=C:
+            #print("condition 2 satisfied")
+            #print((min(abs(x-C),abs(x-D))))
+            #print(abs(A-C))
+            NM[i][j]=1-((min(abs(x-C),abs(x-D)))/(abs(A-C)))
+            WNM[i][j]=weight[j]*NM[i][j]
+        elif x>=D and x<=B and D!=B:
+            #print("condition 3 satisfied")
+            #print((min(abs(x-C),abs(x-D))))
+            #print(abs(A-C))
+            NM[i][j]=1-((min(abs(x-C),abs(x-D)))/(abs(D-B)))
+            WNM[i][j]=weight[j]*NM[i][j]
+
+@cuda.jit
+def fin_calculation(I_minus,WNM,weight,I_plus,R,qos_rows,qos_col):
+  i = cuda.grid(1)
+  if i < qos_rows:
+    temp=0.0
+    temp1=0.0
+    for j in range(0,qos_col):
+        temp=temp+(WNM[i][j]*WNM[i][j])
+        temp1=temp1+((WNM[i][j]-weight[j])*(WNM[i][j]-weight[j]))
+    I_minus[i]=math.sqrt(temp)
+    I_plus[i]=math.sqrt(temp1)
+    R[i]=I_minus[i]/(I_minus[i]+I_plus[i])
+
+
+def ref_cal(ref):
+    for i in range(0,n):
+        temp=0.0
+        max1=0.0
+        min1=999999
+        for j in range(0,4):
+            temp=temp+qos[i][j]
+            if max1<qos[i][j]:
+                max1=qos[i][j]
+            if min1>qos[i][j]:
+                min1=qos[i][j]
+        temp=temp/n
+        ref[i][0]=min1
+        ref[i][1]=max1
+        ref[i][2]=temp
+        ref[i][3]=temp
+    return ref
+    
+
+
+
+        
+qos= [[30,0,2,3,3,2],[40,9,1,3,2,2],[25,0,3,1,3,2],[27,0,5,3,3,1],[45,15,2,2,3,4]]
+ref=[[23,60,30,35],[0,15,15,15],[0,10,0,0],[1,3,3,3],[1,3,3,3],[1,5,4,5]]
+qos_rows=len(qos)
+qos_col=len(qos[0])
+NM=[[0.0 for i in range(qos_col)] for j in range(qos_rows)] 
+weight=[0.2262,0.2143,0.1786,0.1429,0.119,0.119]
+WNM=[[0.0 for i in range(qos_col)] for j in range(qos_rows)] 
+I_plus=[0.0 for i in range(qos_rows)]
+I_minus=[0.0 for i in range(qos_rows)]
+R=[0.0 for i in range(qos_rows)]
+service=[]
+for i in range(0,qos_rows):
+    service.append(i+1)
+
+start_time =time.time()
+
+#copy to global memory
+qos_global_mem = cuda.to_device(qos)
+ref_global_mem = cuda.to_device(ref)
+NM_global_mem = cuda.to_device(NM)
+weight_global_mem = cuda.to_device(weight)
+WNM_global_mem = cuda.to_device(WNM)
+I_plus_global_mem = cuda.to_device(I_plus)
+I_minus_global_mem = cuda.to_device(I_minus)
+R_global_mem = cuda.to_device(R)
+
+start_time =time.time()
+
+threadsperblock = (170, qos_col)
+blockspergrid_x = int(math.ceil(qos_rows / threadsperblock[0]))
+blockspergrid_y = int(math.ceil(qos_col / threadsperblock[1]))
+blockspergrid = (blockspergrid_x, blockspergrid_y)
+
+RIM_calculation[blockspergrid, threadsperblock](qos_global_mem,NM_global_mem,ref_global_mem,qos_rows,qos_col,weight_global_mem,WNM_global_mem)
+WNM = WNM_global_mem.copy_to_host()
+
+threadsperblock = 250
+blockspergrid = math.ceil(250 / threadsperblock)
+fin_calculation[blockspergrid, threadsperblock](I_minus_global_mem,WNM_global_mem,weight_global_mem,I_plus_global_mem,R_global_mem,qos_rows,qos_col)
+R = R_global_mem.copy_to_host()
+
+array = numpy.array(R)
+order = array.argsort()
+ranks = order.argsort()
+l1=list(ranks)
+l2=list(service)
+l1,l2=zip(*sorted(zip(l1, l2)))
+new_tup = l2[::-1]
+duration = time.time() - start_time
+
+print("---------------------------------------------------")
+print("RIM GPU - Number of Services:",qos_rows)
+print("---------------------------------------------------")
+print("Ranking based on RIM !!!")
+#print(new_tup)
+print("---------------------------------------------------")
+print("Total time for Execution !!!")
+print(duration)
+
